@@ -51,7 +51,7 @@ jobs:
           echo "TAG=latest" >> $GITHUB_ENV
           echo "RELEASE_VER=latest" >> $GITHUB_ENV
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: ~/go/pkg/mod
           key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
