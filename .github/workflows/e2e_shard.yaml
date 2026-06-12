@@ -78,7 +78,7 @@ jobs:
           curl -LO https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl && sudo install kubectl /usr/local/bin/kubectl
 
       - name: Download Images
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: volcano-images
           path: _output/images
