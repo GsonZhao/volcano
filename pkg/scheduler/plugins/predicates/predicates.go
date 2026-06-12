@@ -626,6 +626,12 @@ func (pp *PredicatesPlugin) InitPlugin() {
 		addPreFilterPlugin(dynamicresources.Name, dynamicResourceAllocationPlugin)
 		addReservePlugin(dynamicresources.Name, dynamicResourceAllocationPlugin)
 		addPreBindPlugin(dynamicresources.Name, dynamicResourceAllocationPlugin)
+
+		draWeight := 2
+		if w, ok := framework.Get[int](pp.pluginArguments, "dynamicresources.weight"); ok {
+			draWeight = w
+		}
+		addScorePlugin(dynamicresources.Name, &scorePluginAdapter{ScorePlugin: dynamicResourceAllocationPlugin}, draWeight)
 	}
 
 	pp.FilterPlugins = filterPlugins
@@ -761,7 +767,10 @@ func (pp *PredicatesPlugin) BatchNodeOrder(task *api.TaskInfo, nodes []fwk.NodeI
 			continue
 		}
 		// Get normalizer (most plugins don't need normalization, use EmptyNormalizer by default)
-		normalizer := &nodescore.EmptyNormalizer{}
+		var normalizer fwk.ScoreExtensions = &nodescore.EmptyNormalizer{}
+		if se := plugin.ScoreExtensions(); se != nil {
+			normalizer = se
+		}
 
 		// Get weight from ScoreWeights map, default to 1 if not set
 		weight := 1
@@ -905,6 +914,20 @@ func handleSkipPrePredicatePlugin(status *fwk.Status, state *k8sframework.CycleS
 }
 
 func (pp *PredicatesPlugin) OnSessionClose(ssn *framework.Session) {}
+
+// scorePluginAdapter wraps a fwk.ScorePlugin and safely delegates PreScore calls.
+// Some kube-scheduler score plugins (e.g. DynamicResources) do not implement PreScorePlugin,
+// so this adapter uses a type assertion to check at runtime whether PreScore is available.
+type scorePluginAdapter struct {
+	fwk.ScorePlugin
+}
+
+func (s *scorePluginAdapter) PreScore(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodes []fwk.NodeInfo) *fwk.Status {
+	if p, ok := s.ScorePlugin.(fwk.PreScorePlugin); ok {
+		return p.PreScore(ctx, state, pod, nodes)
+	}
+	return nil
+}
 
 // ResetVolumeBindingPluginForTest resets the volumeBindingPluginInstance and volumeBindingPluginOnce for testing purposes only.
 // This function is necessary because volumeBindingPluginInstance is a global variable initialized with sync.Once,
