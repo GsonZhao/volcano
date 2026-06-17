@@ -85,6 +85,18 @@ const (
 	// DynamicResourceAllocationEnable is the key for enabling Dynamic Resource Allocation Predicates in scheduler configmap
 	DynamicResourceAllocationEnable = "predicate.DynamicResourceAllocationEnable"
 
+	// DynamicResourceAllocationWeightKey is the config key for the DRA weight.
+	DynamicResourceAllocationWeightKey = "dynamicresources.weight"
+
+	// DRAScarcityPenaltyWeightKey is the config key for the DRA scarcity weight.
+	// It controls how strongly non-DRA tasks are steered away from DRA-capable nodes
+	// to preserve scarce DRA resources for workloads that actually need them.
+	// The score is calculated as: non-DRA nodes receive MaxNodeScore (100), DRA nodes
+	// receive 0, then the result is multiplied by this weight — consistent with the
+	// normalization approach used by other scoring plugins.
+	// Default: 2. Set to 0 to disable.
+	DRAScarcityPenaltyWeightKey = "dynamicresources.scarcityPenaltyWeight"
+
 	// CachePredicate control cache predicate feature
 	CachePredicate = "predicate.CacheEnable"
 )
@@ -628,7 +640,7 @@ func (pp *PredicatesPlugin) InitPlugin() {
 		addPreBindPlugin(dynamicresources.Name, dynamicResourceAllocationPlugin)
 
 		draWeight := 2
-		if w, ok := framework.Get[int](pp.pluginArguments, "dynamicresources.weight"); ok {
+		if w, ok := framework.Get[int](pp.pluginArguments, DynamicResourceAllocationWeightKey); ok {
 			draWeight = w
 		}
 		addScorePlugin(dynamicresources.Name, &scorePluginAdapter{ScorePlugin: dynamicResourceAllocationPlugin}, draWeight)
@@ -756,6 +768,72 @@ func (pp *PredicatesPlugin) Predicate(task *api.TaskInfo, node *api.NodeInfo, st
 	return nil
 }
 
+// draScarcityPenalty scores nodes based on DRA device availability for non-DRA tasks.
+// Non-DRA nodes receive MaxNodeScore (100), DRA-capable nodes receive 0, and the result
+// is multiplied by the configured weight. This normalized approach ensures the DRA
+// scarcity signal is on the same scale as other scoring plugins (e.g. TaintToleration,
+// PodTopologySpread), unlike the previous flat-penalty approach.
+func (pp *PredicatesPlugin) draScarcityPenalty(task *api.TaskInfo, nodes []fwk.NodeInfo) map[string]float64 {
+	if !pp.enabledPredicates.dynamicResourceAllocationEnable {
+		return nil
+	}
+	// Only score tasks that do NOT need DRA resources
+	if len(task.DRAResreq) > 0 {
+		return nil
+	}
+
+	draManager := pp.Handle.SharedDRAManager()
+	if draManager == nil {
+		return nil
+	}
+
+	// Query ResourceSlices to find which nodes have DRA devices
+	slices, err := draManager.ResourceSlices().ListWithDeviceTaintRules()
+	if err != nil {
+		klog.V(5).Infof("DRA scarcity: failed to list ResourceSlices: %v", err)
+		return nil
+	}
+
+	// Build set of nodes that have DRA devices
+	draNodes := make(map[string]bool)
+	for _, slice := range slices {
+		if slice.Spec.NodeName != nil && *slice.Spec.NodeName != "" {
+			draNodes[*slice.Spec.NodeName] = true
+		}
+	}
+
+	if len(draNodes) == 0 {
+		return nil
+	}
+
+	// Get configured weight (acts as multiplier, same as other score plugins)
+	weight := 2
+	if w, ok := framework.Get[int](pp.pluginArguments, DRAScarcityPenaltyWeightKey); ok {
+		weight = w
+	}
+	if weight <= 0 {
+		return nil
+	}
+
+	// Normalized scoring: non-DRA nodes get MaxNodeScore * weight,
+	// DRA nodes get 0. This steers non-DRA tasks toward non-DRA nodes
+	// while keeping the score magnitude consistent with other plugins.
+	scores := make(map[string]float64, len(nodes))
+	for _, node := range nodes {
+		nodeName := node.Node().Name
+		if draNodes[nodeName] {
+			scores[nodeName] = 0
+			klog.V(5).Infof("DRA scarcity: task %s/%s scored node %s as 0 (node has DRA devices, task does not need DRA)",
+				task.Namespace, task.Name, nodeName)
+		} else {
+			scores[nodeName] = float64(fwk.MaxNodeScore) * float64(weight)
+			klog.V(5).Infof("DRA scarcity: task %s/%s scored node %s as %.0f (node has no DRA devices, preferred for non-DRA task)",
+				task.Namespace, task.Name, nodeName, scores[nodeName])
+		}
+	}
+	return scores
+}
+
 // BatchNodeOrder runs all Score plugins for the given task and nodes.
 func (pp *PredicatesPlugin) BatchNodeOrder(task *api.TaskInfo, nodes []fwk.NodeInfo, state *k8sframework.CycleState) (map[string]float64, error) {
 	nodeScores := make(map[string]float64, len(nodes))
@@ -789,6 +867,11 @@ func (pp *PredicatesPlugin) BatchNodeOrder(task *api.TaskInfo, nodes []fwk.NodeI
 			nodeName := node.Node().Name
 			nodeScores[nodeName] += pluginScores[nodeName]
 		}
+	}
+
+	// Apply DRA scarcity scoring: non-DRA tasks prefer non-DRA nodes (normalized score)
+	for nodeName, score := range pp.draScarcityPenalty(task, nodes) {
+		nodeScores[nodeName] += score
 	}
 
 	klog.V(4).Infof("Batch Total Score for task %s/%s is: %v", task.Namespace, task.Name, nodeScores)

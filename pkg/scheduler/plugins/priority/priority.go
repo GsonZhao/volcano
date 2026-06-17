@@ -55,6 +55,17 @@ func (pp *priorityPlugin) OnSessionOpen(ssn *framework.Session) {
 			lv.Namespace, lv.Name, lv.Priority, rv.Namespace, rv.Name, rv.Priority)
 
 		if lv.Priority == rv.Priority {
+			// When priorities are equal, DRA tasks are scheduled first.
+			// This ensures DRA pods secure their required DRA nodes before
+			// non-DRA pods can fall back to DRA nodes as a last resort.
+			lHasDRA := len(lv.DRAResreq) > 0
+			rHasDRA := len(rv.DRAResreq) > 0
+			if lHasDRA && !rHasDRA {
+				return -1
+			}
+			if !lHasDRA && rHasDRA {
+				return 1
+			}
 			return 0
 		}
 

@@ -1,0 +1,8 @@
+debug=true
+[registry."docker.io"]
+mirrors = [
+        "https://docker.1ms.run"
+]
+[registry."192.168.9.61:8081"]
+  http = true
+  insecure = true

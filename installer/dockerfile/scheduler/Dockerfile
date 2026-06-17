@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM docker.1ms.run/golang:1.25.0 AS builder
+FROM docker.1ms.run/golang:1.25.11 AS builder
 ENV GOPROXY=https://goproxy.cn,direct
 WORKDIR /go/src/volcano.sh/
 COPY go.mod go.sum ./

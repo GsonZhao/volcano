@@ -22,10 +22,18 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/informers"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/dynamic-resource-allocation/structured"
 	fwk "k8s.io/kube-scheduler/framework"
+	k8sframework "k8s.io/kubernetes/pkg/scheduler/framework"
 
+	"volcano.sh/volcano/pkg/scheduler/api"
+	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/plugins/util/k8s"
 )
 
@@ -194,4 +202,195 @@ func TestScorePluginAdapter_PreScore(t *testing.T) {
 			t.Errorf("Expected PreScore to be called on the mock plugin")
 		}
 	})
+}
+
+// --- Mock types for DRA scarcity scoring test ---
+
+type mockSharedDRAManager struct {
+	slices []*resourcev1.ResourceSlice
+}
+
+func (m *mockSharedDRAManager) ResourceClaims() fwk.ResourceClaimTracker { return &mockClaimTracker{} }
+func (m *mockSharedDRAManager) ResourceSlices() fwk.ResourceSliceLister {
+	return &mockSliceLister{slices: m.slices}
+}
+func (m *mockSharedDRAManager) DeviceClasses() fwk.DeviceClassLister { return &mockDeviceClassLister{} }
+func (m *mockSharedDRAManager) DeviceClassResolver() fwk.DeviceClassResolver {
+	return &mockDeviceClassResolver{}
+}
+
+type mockClaimTracker struct{}
+
+func (m *mockClaimTracker) List() ([]*resourcev1.ResourceClaim, error) { return nil, nil }
+func (m *mockClaimTracker) Get(namespace, claimName string) (*resourcev1.ResourceClaim, error) {
+	return nil, nil
+}
+func (m *mockClaimTracker) ListAllAllocatedDevices() (sets.Set[structured.DeviceID], error) {
+	return nil, nil
+}
+func (m *mockClaimTracker) GatherAllocatedState() (*structured.AllocatedState, error) {
+	return nil, nil
+}
+func (m *mockClaimTracker) AssumeClaimAfterAPICall(claim *resourcev1.ResourceClaim) error {
+	return nil
+}
+func (m *mockClaimTracker) SignalClaimPendingAllocation(claimUID types.UID, allocatedClaim *resourcev1.ResourceClaim) error {
+	return nil
+}
+func (m *mockClaimTracker) RemoveClaimPendingAllocation(claimUID types.UID) (deleted bool) {
+	return false
+}
+func (m *mockClaimTracker) ClaimHasPendingAllocation(claimUID types.UID) bool { return false }
+func (m *mockClaimTracker) AssumedClaimRestore(namespace, claimName string)   {}
+
+type mockSliceLister struct {
+	slices []*resourcev1.ResourceSlice
+}
+
+func (m *mockSliceLister) ListWithDeviceTaintRules() ([]*resourcev1.ResourceSlice, error) {
+	return m.slices, nil
+}
+
+type mockDeviceClassLister struct{}
+
+func (m *mockDeviceClassLister) List() ([]*resourcev1.DeviceClass, error) { return nil, nil }
+func (m *mockDeviceClassLister) Get(className string) (*resourcev1.DeviceClass, error) {
+	return nil, nil
+}
+
+type mockDeviceClassResolver struct{}
+
+func (m *mockDeviceClassResolver) GetDeviceClass(resourceName v1.ResourceName) *resourcev1.DeviceClass {
+	return nil
+}
+
+func TestDRAScarcityPenalty(t *testing.T) {
+	nodeWithGPU := "lynxi-116"
+	nodeWithAPU := "lynxi-161"
+	nodeWithLink := "lynxi-178"
+	nodeNoDRA := "master-230"
+
+	// Build ResourceSlices: 3 nodes have DRA devices, 1 does not
+	resourceSlices := []*resourcev1.ResourceSlice{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "gpu-slice"},
+			Spec: resourcev1.ResourceSliceSpec{
+				NodeName: &nodeWithGPU,
+				Devices:  []resourcev1.Device{{Name: "gpu-0"}},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "apu-slice"},
+			Spec: resourcev1.ResourceSliceSpec{
+				NodeName: &nodeWithAPU,
+				Devices:  []resourcev1.Device{{Name: "apu-0"}},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "link-slice"},
+			Spec: resourcev1.ResourceSliceSpec{
+				NodeName: &nodeWithLink,
+				Devices:  []resourcev1.Device{{Name: "link-0"}},
+			},
+		},
+		// master-230 has NO ResourceSlice → not a DRA node
+	}
+
+	// Build fwk.NodeInfo list
+	buildNodeInfo := func(name string) fwk.NodeInfo {
+		node := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}
+		ni := k8sframework.NewNodeInfo()
+		ni.SetNode(node)
+		return ni
+	}
+	nodes := []fwk.NodeInfo{
+		buildNodeInfo(nodeWithGPU),
+		buildNodeInfo(nodeWithAPU),
+		buildNodeInfo(nodeWithLink),
+		buildNodeInfo(nodeNoDRA),
+	}
+
+	tests := []struct {
+		name          string
+		task          *api.TaskInfo
+		expectedScore map[string]float64 // nodeName → expected score
+		draEnabled    bool
+	}{
+		{
+			name: "non-DRA task: DRA nodes get 0, non-DRA node gets MaxNodeScore*weight",
+			task: &api.TaskInfo{
+				Pod:       &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "decoder-0", Namespace: "default"}},
+				DRAResreq: nil, // no DRA requirements
+			},
+			draEnabled: true,
+			expectedScore: map[string]float64{
+				nodeWithGPU:  0,
+				nodeWithAPU:  0,
+				nodeWithLink: 0,
+				nodeNoDRA:    200, // MaxNodeScore(100) * defaultWeight(2)
+			},
+		},
+		{
+			name: "DRA task gets no scarcity scoring",
+			task: &api.TaskInfo{
+				Pod: &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "encoder-0", Namespace: "default"}},
+				DRAResreq: map[string]*api.DRAResource{
+					"gpu.example.com": {Count: 1},
+				},
+			},
+			draEnabled: true,
+			expectedScore: map[string]float64{
+				nodeWithGPU:  0,
+				nodeWithAPU:  0,
+				nodeWithLink: 0,
+				nodeNoDRA:    0,
+			},
+		},
+		{
+			name: "non-DRA task with DRA disabled gets no scarcity scoring",
+			task: &api.TaskInfo{
+				Pod:       &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "worker-0", Namespace: "default"}},
+				DRAResreq: nil,
+			},
+			draEnabled: false,
+			expectedScore: map[string]float64{
+				nodeWithGPU:  0,
+				nodeWithAPU:  0,
+				nodeWithLink: 0,
+				nodeNoDRA:    0,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pp := &PredicatesPlugin{
+				pluginArguments: framework.Arguments{},
+				enabledPredicates: predicateEnable{
+					dynamicResourceAllocationEnable: tt.draEnabled,
+				},
+			}
+			nodeMap := map[string]fwk.NodeInfo{}
+			client := k8sfake.NewSimpleClientset()
+			informerFactory := informers.NewSharedInformerFactory(client, 0)
+			pp.Handle = k8s.NewFramework(
+				nodeMap,
+				k8s.WithSharedDRAManager(&mockSharedDRAManager{slices: resourceSlices}),
+				k8s.WithClientSet(client),
+				k8s.WithInformerFactory(informerFactory),
+			)
+
+			scores := pp.draScarcityPenalty(tt.task, nodes)
+
+			for nodeName, expected := range tt.expectedScore {
+				got := 0.0
+				if s, ok := scores[nodeName]; ok {
+					got = s
+				}
+				if got != expected {
+					t.Errorf("node %s: expected score %v, got %v", nodeName, expected, got)
+				}
+			}
+		})
+	}
 }
