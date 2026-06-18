@@ -176,3 +176,84 @@ func TestPickUpPendingTasks(t *testing.T) {
 		}
 	}
 }
+
+// TestPickUpPendingTasksSkipsUnresolvedDRA verifies that backfill skips
+// BestEffort tasks whose DRA ResourceClaims are not yet resolved, preserving
+// gang scheduling integrity.
+func TestPickUpPendingTasksSkipsUnresolvedDRA(t *testing.T) {
+	framework.RegisterPluginBuilder("priority", priority.New)
+	framework.RegisterPluginBuilder("drf", drf.New)
+	trueValue := true
+	tiers := []conf.Tier{
+		{
+			Plugins: []conf.PluginOption{
+				{
+					Name:               "priority",
+					EnabledPreemptable: &trueValue,
+					EnabledTaskOrder:   &trueValue,
+					EnabledJobOrder:    &trueValue,
+				},
+				{
+					Name:              "drf",
+					EnabledQueueOrder: &trueValue,
+				},
+			},
+		},
+	}
+
+	claimTemplate := "claim-template"
+
+	schedulerCache := &cache.SchedulerCache{
+		Nodes:          make(map[string]*api.NodeInfo),
+		Jobs:           make(map[api.JobID]*api.JobInfo),
+		Queues:         make(map[api.QueueID]*api.QueueInfo),
+		Binder:         nil,
+		StatusUpdater:  &util.FakeStatusUpdater{},
+		Recorder:       record.NewFakeRecorder(100),
+		HyperNodesInfo: api.NewHyperNodesInfo(nil),
+	}
+
+	q := util.BuildQueue("q1", 1, nil)
+	schedulerCache.AddQueueV1beta1(q)
+
+	pg := util.BuildPodGroupWithPrio("pg1", "default", "q1", 1, map[string]int32{"": 2}, schedulingv1beta1.PodGroupInqueue, "")
+	schedulerCache.AddPodGroupV1beta1(pg)
+
+	// A normal BestEffort pod (no DRA claims) — should be picked up.
+	normalPod := util.BuildPodWithPriority("default", "normal-besteffort", "", v1.PodPending, nil, "pg1", make(map[string]string), make(map[string]string), nil)
+	schedulerCache.AddPod(normalPod)
+
+	// A BestEffort pod with an unresolved DRA ResourceClaim — should be skipped.
+	// Since resourceClaimCache is nil on this plain SchedulerCache,
+	// buildTaskDRAInfo returns early and ResourceClaimKeys stays empty,
+	// simulating the "DRA not yet resolved" state.
+	draPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "dra-unresolved",
+			Namespace: "default",
+			UID:       "dra-unresolved-uid",
+			Annotations: map[string]string{
+				schedulingv1beta1.KubeGroupNameAnnotationKey: "pg1",
+			},
+		},
+		Spec: v1.PodSpec{
+			SchedulerName: "volcano",
+			ResourceClaims: []v1.PodResourceClaim{
+				{Name: "claim1", ResourceClaimTemplateName: &claimTemplate},
+			},
+		},
+	}
+	schedulerCache.AddPod(draPod)
+
+	ssn := framework.OpenSession(schedulerCache, tiers, []conf.Configuration{})
+
+	tasks := New().pickUpPendingTasks(ssn)
+	var names []string
+	for _, task := range tasks {
+		names = append(names, task.Name)
+	}
+
+	// Only the normal pod should be picked up; the DRA pod must be skipped.
+	assert.Equal(t, []string{"normal-besteffort"}, names,
+		"DRA pod with unresolved claims should be skipped in backfill")
+}

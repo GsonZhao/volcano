@@ -146,6 +146,22 @@ func (backfill *Action) pickUpPendingTasks(ssn *framework.Session) []*api.TaskIn
 				continue
 			}
 
+			// Skip tasks whose DRA ResourceClaims are not yet resolved.
+			// Such tasks were added to cache with partial info (for gang
+			// validation via CheckTaskValid), but scheduling them now
+			// would break gang integrity: the DynamicResources predicate
+			// cannot evaluate without resolved claim information, leading
+			// to partial gang scheduling where non-DRA tasks get bound
+			// while DRA tasks remain unschedulable.
+			// The resync mechanism will re-add the task with full DRA info
+			// once claims are resolved, at which point the entire gang
+			// can be scheduled together.
+			if len(task.Pod.Spec.ResourceClaims) > 0 && len(task.ResourceClaimKeys) == 0 {
+				klog.V(4).Infof("Task <%v/%v> has unresolved DRA ResourceClaims, skip backfill to preserve gang integrity.",
+					task.Namespace, task.Name)
+				continue
+			}
+
 			if _, existed := tasks[job.UID]; !existed {
 				tasks[job.UID] = util.NewPriorityQueue(ssn.TaskOrderFn)
 			}
@@ -154,6 +170,11 @@ func (backfill *Action) pickUpPendingTasks(ssn *framework.Session) []*api.TaskIn
 
 		for _, task := range job.TaskStatusIndex[api.Pipelined] {
 			if !task.BestEffort {
+				continue
+			}
+
+			// Same guard for pipelined tasks with unresolved DRA claims.
+			if len(task.Pod.Spec.ResourceClaims) > 0 && len(task.ResourceClaimKeys) == 0 {
 				continue
 			}
 
